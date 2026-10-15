@@ -55,7 +55,7 @@ import java.util.Locale
 import java.util.TimeZone
 
 private const val APP_TITLE = "G-PULSE"
-private const val APP_VERSION = "v1.0"
+private const val APP_VERSION = "v2.0"
 private const val UNPAIRED_WATCH_TITLE = "Connect your CasiOak"
 private const val PAIRED_FALLBACK_LABEL = "CASIO G-SHOCK"
 
