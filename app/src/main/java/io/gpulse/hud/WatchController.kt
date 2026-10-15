@@ -21,11 +21,11 @@ import kotlinx.coroutines.withTimeout
 import org.avmedia.gshockapi.GShockAPI
 import org.avmedia.gshockapi.ProgressEvents
 import org.avmedia.gshockapi.WatchInfo
-import org.avmedia.gshockapi.model.Alarm
-import org.avmedia.gshockapi.model.Settings
 import org.avmedia.gshockapi.io.CachedIO
 import org.avmedia.gshockapi.io.TimeIO
 import org.avmedia.gshockapi.io.WatchConditionIO
+import org.avmedia.gshockapi.model.Alarm
+import org.avmedia.gshockapi.model.Settings
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -34,9 +34,9 @@ import java.util.TimeZone
 import kotlin.math.min
 
 data class AlarmEntry(
-    val hour: Int,
-    val minute: Int,
-    val enabled: Boolean,
+    val hour: Int? = null,
+    val minute: Int? = null,
+    val enabled: Boolean = false,
     val hasHourlyChime: Boolean = false
 )
 
@@ -70,13 +70,17 @@ class WatchController private constructor(appContext: Context) {
     private val _detectedModelName = MutableStateFlow<String?>(Prefs.getSavedName(context))
     val detectedModelName: StateFlow<String?> = _detectedModelName
 
+    /** 5 alarm slots start empty (--:--) until set by the user or loaded as active from the watch. */
     private val _alarms = MutableStateFlow<List<AlarmEntry>>(
-        List(5) { AlarmEntry(hour = 7, minute = 0, enabled = false, hasHourlyChime = false) }
+        List(5) { AlarmEntry(hour = null, minute = null, enabled = false, hasHourlyChime = false) }
     )
     val alarms: StateFlow<List<AlarmEntry>> = _alarms
 
     private val _watchConfig = MutableStateFlow(WatchConfigState())
     val watchConfig: StateFlow<WatchConfigState> = _watchConfig
+
+    private val _selectedTimezone = MutableStateFlow(Prefs.getSelectedTimezone(context))
+    val selectedTimezone: StateFlow<String> = _selectedTimezone
 
     private val _settingsStatus = MutableStateFlow<String?>(null)
     val settingsStatus: StateFlow<String?> = _settingsStatus
@@ -160,11 +164,11 @@ class WatchController private constructor(appContext: Context) {
         ProgressEvents.subscriber.start(this.javaClass.canonicalName ?: TAG, { event ->
             when (event) {
                 ProgressEvents["ConnectionStarted"] -> {
-                    _connectionStatus.value = "Connecting to ${resolveDisplayModel()}..."
+                    _connectionStatus.value = "Connecting..."
                     log("BLE ConnectionStarted")
                 }
                 ProgressEvents["ConnectionSetupComplete"] -> {
-                    _connectionStatus.value = "Connected (Setting up GATT...)"
+                    _connectionStatus.value = "Setting up link..."
                     log("BLE ConnectionSetupComplete")
                 }
                 ProgressEvents["WatchInitializationCompleted"] -> onWatchReady()
@@ -180,7 +184,7 @@ class WatchController private constructor(appContext: Context) {
         lastBleActivityMs = System.currentTimeMillis()
         _isConnected.value = true
         val model = resolveDisplayModel()
-        _connectionStatus.value = "Connected & Ready"
+        _connectionStatus.value = "Connected"
         log("$model Connected! Pre-warming HUD link...")
 
         scope.launch {
@@ -202,12 +206,36 @@ class WatchController private constructor(appContext: Context) {
         timezoneSynced = false
         _batteryLevel.value = null
         _isConnected.value = false
+        val auto = Prefs.isAutoConnect(context)
         _connectionStatus.value =
-            if (stopRequested) "Disconnected" else "Disconnected (Auto-Reconnecting...)"
+            if (stopRequested || !auto) "Disconnected" else "Auto-connecting..."
         log(if (clockDirty) "Watch disconnected. Real time will be restored on reconnect." else "Watch disconnected.")
     }
 
-    fun startPersistentConnection(savedAddress: String?) {
+    fun setAutoConnectEnabled(enabled: Boolean) {
+        Prefs.setAutoConnect(context, enabled)
+        val savedAddr = Prefs.getSavedAddress(context)
+        if (enabled) {
+            log("Auto-connect enabled.")
+            if (!_isConnected.value && !savedAddr.isNullOrBlank()) {
+                KeepAliveService.start(context)
+                startPersistentConnection(savedAddr, forceOnce = false)
+            }
+        } else {
+            log("Auto-connect disabled.")
+            if (!_isConnected.value) {
+                connectionLoopJob?.cancel()
+                connectionLoopJob = null
+                _connectionStatus.value = "Disconnected"
+            }
+        }
+    }
+
+    fun startPersistentConnection(savedAddress: String?, forceOnce: Boolean = false) {
+        if (!Prefs.isAutoConnect(context) && !forceOnce) {
+            _connectionStatus.value = "Disconnected"
+            return
+        }
         stopRequested = false
         connectionLoopJob?.cancel()
         connectionLoopJob = scope.launch {
@@ -224,6 +252,11 @@ class WatchController private constructor(appContext: Context) {
                 }
 
                 _isConnected.value = false
+                if (!Prefs.isAutoConnect(context) && !forceOnce) {
+                    _connectionStatus.value = "Disconnected"
+                    break
+                }
+
                 val connected = try {
                     attemptConnection(savedAddress)
                 } catch (e: CancellationException) {
@@ -234,6 +267,11 @@ class WatchController private constructor(appContext: Context) {
                 }
 
                 if (!connected) {
+                    if (!Prefs.isAutoConnect(context)) {
+                        _connectionStatus.value = "Disconnected"
+                        break
+                    }
+                    _connectionStatus.value = "Auto-connecting..."
                     delay(backoffMs)
                     backoffMs = min(backoffMs * 2, RECONNECT_MAX_MS)
                 }
@@ -248,13 +286,12 @@ class WatchController private constructor(appContext: Context) {
         val savedName = Prefs.getSavedName(context)?.takeIf { it.startsWith("CASIO", ignoreCase = true) }
         WatchInfo.setNameAndModel(savedName ?: INTERNAL_FALLBACK_MODEL)
 
-        val displayModel = Prefs.getSavedName(context)?.takeIf { it.isNotBlank() } ?: "CasiOak"
         if (!savedAddress.isNullOrBlank()) {
             WatchInfo.setAddress(savedAddress)
-            _connectionStatus.value = "Waiting for $displayModel..."
+            _connectionStatus.value = if (Prefs.isAutoConnect(context)) "Auto-connecting..." else "Connecting..."
             api.waitForConnection(savedAddress)
         } else {
-            _connectionStatus.value = "Waiting for your CasiOak..."
+            _connectionStatus.value = "Waiting for CasiOak..."
             api.waitForConnection("")
         }
 
@@ -267,7 +304,7 @@ class WatchController private constructor(appContext: Context) {
         if (!api.isConnected()) return false
         _isConnected.value = true
         resolveDisplayModel()
-        _connectionStatus.value = "Connected & Ready"
+        _connectionStatus.value = "Connected"
         return true
     }
 
@@ -295,7 +332,7 @@ class WatchController private constructor(appContext: Context) {
         keepAliveJob?.cancel()
         connectionLoopJob?.cancel()
         connectionLoopJob = null
-        _connectionStatus.value = "Syncing real time (disconnecting in 5s)..."
+        _connectionStatus.value = "Syncing time (5s)..."
         log("Disconnect requested: syncing real time first...")
 
         scope.launch {
@@ -382,8 +419,9 @@ class WatchController private constructor(appContext: Context) {
 
     private suspend fun ensureTimezoneSynced() {
         if (!timezoneSynced) {
+            val tzId = Prefs.getSelectedTimezone(context)
             runCatching {
-                TimeIO.setTimezone(TimeZone.getDefault().id)
+                TimeIO.setTimezone(tzId)
                 timezoneSynced = true
             }
         }
@@ -425,10 +463,18 @@ class WatchController private constructor(appContext: Context) {
     }
 
     private suspend fun restoreClock() {
-        log("Syncing real phone time to watch...")
-        writeWatchTimeFast { System.currentTimeMillis() }
+        log("Syncing time to watch (${_selectedTimezone.value})...")
+        writeWatchTimeFast { currentEpochForSelectedTimezone() }
         clockDirty = false
         log("Real time synced.")
+    }
+
+    private fun currentEpochForSelectedTimezone(): Long {
+        val targetTz = TimeZone.getTimeZone(_selectedTimezone.value)
+        val defaultTz = TimeZone.getDefault()
+        val now = System.currentTimeMillis()
+        val offsetDiff = targetTz.getOffset(now) - defaultTz.getOffset(now)
+        return now + offsetDiff
     }
 
     private fun epochMsForTodayAt(hour: Int, minute: Int, second: Int): Long =
@@ -450,7 +496,23 @@ class WatchController private constructor(appContext: Context) {
     fun syncRealTime() {
         launchPriorityWatchOp("Sync real time") {
             restoreClock()
-            _settingsStatus.value = "Watch synced to exact phone time"
+            _settingsStatus.value = "Synced to ${_selectedTimezone.value}"
+        }
+    }
+
+    fun setWatchTimezone(tzId: String) {
+        Prefs.setSelectedTimezone(context, tzId)
+        _selectedTimezone.value = tzId
+        timezoneSynced = false
+        if (api.isConnected()) {
+            launchPriorityWatchOp("Update watch timezone ($tzId)") {
+                runCatching { TimeIO.setTimezone(tzId) }
+                timezoneSynced = true
+                restoreClock()
+                _settingsStatus.value = "Timezone updated to $tzId"
+            }
+        } else {
+            _settingsStatus.value = "Timezone saved ($tzId) — will apply on connect"
         }
     }
 
@@ -462,12 +524,16 @@ class WatchController private constructor(appContext: Context) {
                 runCatching {
                     val rawAlarms = api.getAlarms()
                     if (rawAlarms.isNotEmpty()) {
-                        _alarms.value = rawAlarms.take(5).map {
+                        val currentList = _alarms.value
+                        _alarms.value = rawAlarms.take(5).mapIndexed { idx, a ->
+                            val existing = currentList.getOrNull(idx)
+                            // Keep unconfigured disabled alarms empty (--:--) unless enabled or previously set by user
+                            val showTime = a.enabled || existing?.hour != null
                             AlarmEntry(
-                                hour = it.hour,
-                                minute = it.minute,
-                                enabled = it.enabled,
-                                hasHourlyChime = it.hasHourlyChime
+                                hour = if (showTime) a.hour else null,
+                                minute = if (showTime) a.minute else null,
+                                enabled = a.enabled,
+                                hasHourlyChime = a.hasHourlyChime
                             )
                         }
                         log("Loaded ${rawAlarms.size} alarms from watch.")
@@ -501,6 +567,14 @@ class WatchController private constructor(appContext: Context) {
         pushAlarmsToWatch(current)
     }
 
+    fun clearAlarmSlot(index: Int) {
+        val current = _alarms.value.toMutableList()
+        if (index !in current.indices) return
+        current[index] = current[index].copy(hour = null, minute = null, enabled = false)
+        _alarms.value = current
+        pushAlarmsToWatch(current)
+    }
+
     fun toggleHourlyChime(enabled: Boolean) {
         val current = _alarms.value.toMutableList()
         if (current.isEmpty()) return
@@ -515,9 +589,9 @@ class WatchController private constructor(appContext: Context) {
                 val apiList = ArrayList<Alarm>(
                     entries.mapIndexed { idx, e ->
                         Alarm(
-                            e.hour,
-                            e.minute,
-                            e.enabled,
+                            e.hour ?: 0,
+                            e.minute ?: 0,
+                            e.enabled && e.hour != null && e.minute != null,
                             if (idx == 0) entries[0].hasHourlyChime else false
                         )
                     }

@@ -24,10 +24,12 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
@@ -48,7 +50,9 @@ import androidx.core.location.LocationManagerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import org.avmedia.gshockapi.WatchInfo
+import java.util.Calendar
 import java.util.Locale
+import java.util.TimeZone
 
 private const val APP_TITLE = "G-PULSE"
 private const val APP_VERSION = "v1.0"
@@ -174,12 +178,18 @@ fun MainScreen() {
     val detectedModel by watchController.detectedModelName.collectAsState()
     val alarms by watchController.alarms.collectAsState()
     val watchConfig by watchController.watchConfig.collectAsState()
+    val selectedTimezone by watchController.selectedTimezone.collectAsState()
     val settingsStatus by watchController.settingsStatus.collectAsState()
 
     var currentPage by remember { mutableIntStateOf(0) } // 0 = HUD (Page 1), 1 = Settings (Page 2)
     var refresh by remember { mutableIntStateOf(0) }
     var savedAddress by remember { mutableStateOf(Prefs.getSavedAddress(ctx)) }
     var savedName by remember { mutableStateOf(Prefs.getSavedName(ctx)) }
+    var customWatchLabel by remember { mutableStateOf(Prefs.getCustomWatchLabel(ctx)) }
+    var autoConnect by remember { mutableStateOf(Prefs.isAutoConnect(ctx)) }
+
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var showTimezoneDialog by remember { mutableStateOf(false) }
 
     var vip12 by remember { mutableStateOf(Prefs.getVipContact(ctx, 12)) }
     var vip3 by remember { mutableStateOf(Prefs.getVipContact(ctx, 3)) }
@@ -268,18 +278,47 @@ fun MainScreen() {
         }
     }
 
-    LaunchedEffect(savedAddress) {
-        if (!savedAddress.isNullOrBlank()) {
+    LaunchedEffect(savedAddress, autoConnect) {
+        if (!savedAddress.isNullOrBlank() && autoConnect) {
             KeepAliveService.start(ctx)
             watchController.startPersistentConnection(savedAddress)
         }
     }
 
-    val activeWatchTitle = when {
-        savedAddress == null -> UNPAIRED_WATCH_TITLE
+    val detectedHardwareModel = when {
         !detectedModel.isNullOrBlank() -> detectedModel!!
         !savedName.isNullOrBlank() -> savedName!!
         else -> PAIRED_FALLBACK_LABEL
+    }
+
+    val activeWatchTitle = when {
+        customWatchLabel.isNotBlank() -> customWatchLabel
+        savedAddress == null -> UNPAIRED_WATCH_TITLE
+        else -> detectedHardwareModel
+    }
+
+    if (showRenameDialog) {
+        PersonalizeWatchDialog(
+            currentLabel = customWatchLabel,
+            detectedModel = detectedHardwareModel,
+            onDismiss = { showRenameDialog = false },
+            onSave = { newLabel ->
+                customWatchLabel = newLabel.trim()
+                Prefs.setCustomWatchLabel(ctx, customWatchLabel)
+                showRenameDialog = false
+            }
+        )
+    }
+
+    if (showTimezoneDialog) {
+        TimezonePickerDialog(
+            currentTz = selectedTimezone,
+            onDismiss = { showTimezoneDialog = false },
+            onSelect = { tzId ->
+                watchController.setWatchTimezone(tzId)
+                showTimezoneDialog = false
+            }
+        )
     }
 
     LazyColumn(
@@ -346,7 +385,7 @@ fun MainScreen() {
             }
         }
 
-        // 2-Page Segmented Navigation Bar (Page 1: HUD | Page 2: SETTINGS)
+        // 2-Page Segmented Navigation Bar
         item(key = "nav_tabs") {
             Row(
                 modifier = Modifier
@@ -383,18 +422,43 @@ fun MainScreen() {
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.Top
                         ) {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    activeWatchTitle,
-                                    color = MonoWhite,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 17.sp
-                                )
+                            Column(
+                                modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.clickable { showRenameDialog = true }
+                                ) {
+                                    Text(
+                                        activeWatchTitle,
+                                        color = MonoWhite,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 17.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Default.Edit,
+                                        contentDescription = "Personalize Watch Name",
+                                        tint = MonoMuted,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                                if (customWatchLabel.isNotBlank() && savedAddress != null) {
+                                    Text(
+                                        detectedHardwareModel,
+                                        color = MonoDim,
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
                                 Text(
                                     if (savedAddress == null) "No CasiOak paired — tap Pair Watch"
-                                    else if (isConnected) "Active BLE Link"
+                                    else if (isConnected) "Connected"
                                     else connectionStatus,
-                                    color = MonoMuted,
+                                    color = if (isConnected) MonoSilver else MonoMuted,
                                     fontSize = 12.sp,
                                     fontFamily = FontFamily.Monospace
                                 )
@@ -413,6 +477,46 @@ fun MainScreen() {
                                     fontSize = 11.sp
                                 )
                             }
+                        }
+
+                        // Auto-Connect Toggle Row on Main Card
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MonoElevated)
+                                .border(1.dp, MonoBorder, RoundedCornerShape(12.dp))
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(
+                                    "Auto-Connect",
+                                    color = MonoWhite,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 13.sp
+                                )
+                                Text(
+                                    "Automatically link when your watch is in range",
+                                    color = MonoMuted,
+                                    fontSize = 11.sp
+                                )
+                            }
+                            Switch(
+                                checked = autoConnect,
+                                onCheckedChange = { enabled ->
+                                    autoConnect = enabled
+                                    watchController.setAutoConnectEnabled(enabled)
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = MonoBlack,
+                                    checkedTrackColor = MonoWhite,
+                                    uncheckedThumbColor = MonoMuted,
+                                    uncheckedTrackColor = MonoBlack,
+                                    uncheckedBorderColor = MonoBorderBright
+                                )
+                            )
                         }
 
                         Row(
@@ -493,7 +597,7 @@ fun MainScreen() {
                                 OutlinedButton(
                                     onClick = {
                                         KeepAliveService.start(ctx)
-                                        watchController.startPersistentConnection(savedAddress)
+                                        watchController.startPersistentConnection(savedAddress, forceOnce = true)
                                     },
                                     enabled = savedAddress != null,
                                     shape = RoundedCornerShape(12.dp),
@@ -535,21 +639,28 @@ fun MainScreen() {
                                         }
                                         WatchInfo.setAddress(d.address)
                                         KeepAliveService.start(ctx)
-                                        watchController.startPersistentConnection(d.address)
+                                        watchController.startPersistentConnection(d.address, forceOnce = true)
                                     }
                                 }
                             }
                         }
 
-                        if (!batteryOptimizationIgnored || savedAddress != null) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "Personalize Watch Name",
+                                color = MonoSilver,
+                                fontSize = 11.sp,
+                                modifier = Modifier.clickable { showRenameDialog = true }
+                            )
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 if (!batteryOptimizationIgnored) {
                                     Text(
-                                        "Unrestrict Background Battery",
+                                        "Unrestrict Battery",
                                         color = MonoSilver,
                                         fontSize = 11.sp,
                                         modifier = Modifier.clickable {
@@ -563,13 +674,11 @@ fun MainScreen() {
                                             }
                                         }
                                     )
-                                } else {
-                                    Spacer(Modifier.width(1.dp))
                                 }
 
                                 if (savedAddress != null) {
                                     Text(
-                                        "Unpair Watch",
+                                        "Unpair",
                                         color = MonoMuted,
                                         fontSize = 11.sp,
                                         modifier = Modifier.clickable {
@@ -661,23 +770,63 @@ fun MainScreen() {
                 }
             }
 
-            // 1. Real-Time Sync Card
+            // 1. Real-Time Sync & Timezone Card
             item(key = "time_sync_card") {
                 MonoCard {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                         Text(
-                            "TIME SYNCHRONIZATION",
+                            "TIME & TIMEZONE SYNC",
                             color = MonoWhite,
                             fontWeight = FontWeight.Bold,
                             fontSize = 14.sp,
                             letterSpacing = 1.sp
                         )
                         Text(
-                            "Calibrate your CasiOak's analog hands and internal clock with your phone's exact system time and timezone.",
+                            "Calibrate your CasiOak's analog hands and world timezone over Bluetooth.",
                             color = MonoMuted,
                             fontSize = 12.sp,
                             lineHeight = 17.sp
                         )
+
+                        // Timezone Selector Row
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MonoElevated)
+                                .border(1.dp, MonoBorder, RoundedCornerShape(12.dp))
+                                .clickable { showTimezoneDialog = true }
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "WATCH TIMEZONE",
+                                    color = MonoMuted,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 10.sp,
+                                    letterSpacing = 1.sp
+                                )
+                                Text(
+                                    selectedTimezone,
+                                    color = MonoWhite,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp
+                                )
+                            }
+                            Text(
+                                "CHANGE",
+                                color = MonoSilver,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.sp,
+                                modifier = Modifier
+                                    .border(1.dp, MonoBorderBright, RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                            )
+                        }
 
                         Button(
                             onClick = { watchController.syncRealTime() },
@@ -706,7 +855,7 @@ fun MainScreen() {
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column {
+                            Column(Modifier.weight(1f)) {
                                 Text(
                                     "WATCH ALARMS & SIGNAL",
                                     color = MonoWhite,
@@ -715,7 +864,7 @@ fun MainScreen() {
                                     letterSpacing = 1.sp
                                 )
                                 Text(
-                                    "Tap any alarm time to edit. Changes write directly to watch.",
+                                    "Tap any slot to set an alarm time. Unset slots remain empty.",
                                     color = MonoMuted,
                                     fontSize = 11.sp
                                 )
@@ -750,10 +899,17 @@ fun MainScreen() {
                                 alarm = alarm,
                                 enabled = isConnected,
                                 onTimeSelected = { h, m ->
-                                    watchController.updateAlarm(idx, h, m, alarm.enabled)
+                                    watchController.updateAlarm(idx, h, m, enabled = true)
+                                },
+                                onClear = {
+                                    watchController.clearAlarmSlot(idx)
                                 },
                                 onToggle = { active ->
-                                    watchController.updateAlarm(idx, alarm.hour, alarm.minute, active)
+                                    val h = alarm.hour
+                                    val m = alarm.minute
+                                    if (h != null && m != null) {
+                                        watchController.updateAlarm(idx, h, m, active)
+                                    }
                                 }
                             )
                         }
@@ -761,7 +917,7 @@ fun MainScreen() {
                 }
             }
 
-            // 3. Hardware Configuration Card (Tone, Light, 24h, Power Saving)
+            // 3. Hardware Configuration Card
             item(key = "hardware_settings_card") {
                 MonoCard {
                     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -838,6 +994,154 @@ fun MainScreen() {
 }
 
 @Composable
+private fun PersonalizeWatchDialog(
+    currentLabel: String,
+    detectedModel: String,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit
+) {
+    var text by remember { mutableStateOf(currentLabel) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MonoSurface,
+        titleContentColor = MonoWhite,
+        textContentColor = MonoSilver,
+        title = {
+            Text("Personalize Watch Name", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Set a custom display name for your watch header, or leave blank to display the detected model ($detectedModel).",
+                    color = MonoMuted,
+                    fontSize = 12.sp
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    placeholder = { Text("Custom watch name...", color = MonoDim, fontSize = 13.sp) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = MonoWhite,
+                        unfocusedTextColor = MonoWhite,
+                        focusedBorderColor = MonoWhite,
+                        unfocusedBorderColor = MonoBorderBright,
+                        cursorColor = MonoWhite
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(text) }) {
+                Text("Save", color = MonoWhite, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            Row {
+                if (currentLabel.isNotBlank()) {
+                    TextButton(onClick = { onSave("") }) {
+                        Text("Reset", color = MonoMuted)
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel", color = MonoMuted)
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun TimezonePickerDialog(
+    currentTz: String,
+    onDismiss: () -> Unit,
+    onSelect: (String) -> Unit
+) {
+    var search by remember { mutableStateOf("") }
+    val allZones = remember { TimeZone.getAvailableIDs().sorted() }
+    val filteredZones = remember(search) {
+        if (search.isBlank()) allZones
+        else allZones.filter { it.contains(search.trim(), ignoreCase = true) }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MonoSurface,
+        titleContentColor = MonoWhite,
+        title = {
+            Text("Select Watch Timezone", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(
+                    onClick = { onSelect(TimeZone.getDefault().id) },
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, MonoBorderBright),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MonoWhite),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Use Phone Default (${TimeZone.getDefault().id})", fontSize = 12.sp)
+                }
+
+                OutlinedTextField(
+                    value = search,
+                    onValueChange = { search = it },
+                    placeholder = { Text("Search city or region (e.g. Asia/Kolkata, UTC)...", color = MonoDim, fontSize = 12.sp) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = MonoWhite,
+                        unfocusedTextColor = MonoWhite,
+                        focusedBorderColor = MonoWhite,
+                        unfocusedBorderColor = MonoBorderBright,
+                        cursorColor = MonoWhite
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(260.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(MonoElevated)
+                        .border(1.dp, MonoBorder, RoundedCornerShape(10.dp))
+                ) {
+                    LazyColumn(contentPadding = PaddingValues(6.dp)) {
+                        items(filteredZones) { tzId ->
+                            val isSelected = tzId == currentTz
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelected) MonoWhite else Color.Transparent)
+                                    .clickable { onSelect(tzId) }
+                                    .padding(horizontal = 10.dp, vertical = 9.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = tzId,
+                                    color = if (isSelected) MonoBlack else MonoWhite,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close", color = MonoMuted)
+            }
+        }
+    )
+}
+
+@Composable
 private fun RowScope.TabPill(title: String, selected: Boolean, onClick: () -> Unit) {
     Box(
         modifier = Modifier
@@ -865,10 +1169,29 @@ private fun AlarmRow(
     alarm: AlarmEntry,
     enabled: Boolean,
     onTimeSelected: (Int, Int) -> Unit,
+    onClear: () -> Unit,
     onToggle: (Boolean) -> Unit
 ) {
     val ctx = LocalContext.current
-    val formattedTime = String.format(Locale.US, "%02d:%02d", alarm.hour, alarm.minute)
+    val hasTime = alarm.hour != null && alarm.minute != null
+    val formattedTime = if (hasTime) {
+        String.format(Locale.US, "%02d:%02d", alarm.hour, alarm.minute)
+    } else {
+        "--:--"
+    }
+
+    val openTimePicker = {
+        val now = Calendar.getInstance()
+        val initialHour = alarm.hour ?: now.get(Calendar.HOUR_OF_DAY)
+        val initialMinute = alarm.minute ?: now.get(Calendar.MINUTE)
+        TimePickerDialog(
+            ctx,
+            { _, h, m -> onTimeSelected(h, m) },
+            initialHour,
+            initialMinute,
+            true
+        ).show()
+    }
 
     Row(
         modifier = Modifier
@@ -876,20 +1199,12 @@ private fun AlarmRow(
             .clip(RoundedCornerShape(12.dp))
             .background(MonoElevated)
             .border(1.dp, MonoBorder, RoundedCornerShape(12.dp))
-            .clickable(enabled = enabled) {
-                TimePickerDialog(
-                    ctx,
-                    { _, h, m -> onTimeSelected(h, m) },
-                    alarm.hour,
-                    alarm.minute,
-                    true
-                ).show()
-            }
+            .clickable(enabled = enabled) { openTimePicker() }
             .padding(horizontal = 14.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Column {
+        Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = "ALARM ${index + 1}",
                 color = MonoMuted,
@@ -899,25 +1214,56 @@ private fun AlarmRow(
             )
             Text(
                 text = formattedTime,
-                color = if (alarm.enabled) MonoWhite else MonoMuted,
+                color = if (hasTime && alarm.enabled) MonoWhite else MonoDim,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Bold,
                 fontSize = 20.sp
             )
+            if (!hasTime) {
+                Text(
+                    text = "Tap to set time",
+                    color = MonoMuted,
+                    fontSize = 10.sp
+                )
+            }
         }
 
-        Switch(
-            checked = alarm.enabled,
-            enabled = enabled,
-            onCheckedChange = onToggle,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = MonoBlack,
-                checkedTrackColor = MonoWhite,
-                uncheckedThumbColor = MonoMuted,
-                uncheckedTrackColor = MonoBlack,
-                uncheckedBorderColor = MonoBorderBright
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            if (hasTime && enabled) {
+                IconButton(
+                    onClick = onClear,
+                    modifier = Modifier.size(30.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Clear,
+                        contentDescription = "Clear Alarm",
+                        tint = MonoMuted,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+            Switch(
+                checked = hasTime && alarm.enabled,
+                enabled = enabled,
+                onCheckedChange = { active ->
+                    if (!hasTime && active) {
+                        openTimePicker()
+                    } else {
+                        onToggle(active)
+                    }
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = MonoBlack,
+                    checkedTrackColor = MonoWhite,
+                    uncheckedThumbColor = MonoMuted,
+                    uncheckedTrackColor = MonoBlack,
+                    uncheckedBorderColor = MonoBorderBright
+                )
             )
-        )
+        }
     }
 }
 
