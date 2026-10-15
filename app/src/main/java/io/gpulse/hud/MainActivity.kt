@@ -981,7 +981,7 @@ fun MainScreen() {
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    "Maintained by Senin Ali KP",
+                    "Created & Maintained by Senin Ali KP",
                     color = MonoMuted,
                     fontSize = 11.sp,
                     fontFamily = FontFamily.Monospace,
