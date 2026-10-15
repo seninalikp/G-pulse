@@ -1,0 +1,49 @@
+name: Build & Attach APK Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Prepare APK Asset
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME:-v2.0}"
+          cp app/build/outputs/apk/debug/app-debug.apk "G-Pulse-${TAG_NAME}.apk"
+
+      - name: Publish Release & Attach APK
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: G-Pulse-*.apk
+          name: "G-Pulse HUD ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          body: |
+            ### 📦 Direct APK Download
+            Download and install the pre-compiled APK directly on your phone:
+            - **[G-Pulse-${{ github.ref_name }}.apk](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/G-Pulse-${{ github.ref_name }}.apk)**
+
+            *(Ignore `Source code (zip)` unless you are compiling from source).*
