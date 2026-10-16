@@ -70,11 +70,13 @@ class WatchController private constructor(appContext: Context) {
     private val _detectedModelName = MutableStateFlow<String?>(Prefs.getSavedName(context))
     val detectedModelName: StateFlow<String?> = _detectedModelName
 
-    /** 5 alarm slots start empty (--:--) until set by the user or loaded as active from the watch. */
     private val _alarms = MutableStateFlow<List<AlarmEntry>>(
         List(5) { AlarmEntry(hour = null, minute = null, enabled = false, hasHourlyChime = false) }
     )
     val alarms: StateFlow<List<AlarmEntry>> = _alarms
+
+    /** Snapshot of the user's manual alarms so temporary call-beep alarms never overwrite user alarms. */
+    private var userAlarmsSnapshot: List<AlarmEntry>? = null
 
     private val _watchConfig = MutableStateFlow(WatchConfigState())
     val watchConfig: StateFlow<WatchConfigState> = _watchConfig
@@ -111,14 +113,14 @@ class WatchController private constructor(appContext: Context) {
         private const val MAX_LOG_LINES = 80
         private const val OP_TIMEOUT_MS = 12_000L
         private const val WRITE_ATTEMPTS = 2
-        private const val WRITE_RETRY_DELAY_MS = 250L
-        private const val KEEP_ALIVE_INTERVAL_MS = 12_000L
+        private const val WRITE_RETRY_DELAY_MS = 200L
+        private const val KEEP_ALIVE_INTERVAL_MS = 15_000L
 
         private const val CONNECT_WAIT_MS = 12_000L
-        private const val CONNECT_POLL_MS = 400L
+        private const val CONNECT_POLL_MS = 300L
         private const val CONNECTED_POLL_MS = 2_500L
         private const val RECONNECT_MIN_MS = 2_000L
-        private const val RECONNECT_MAX_MS = 30_000L
+        private const val RECONNECT_MAX_MS = 25_000L
 
         @Volatile
         private var instance: WatchController? = null
@@ -185,21 +187,36 @@ class WatchController private constructor(appContext: Context) {
         _isConnected.value = true
         val model = resolveDisplayModel()
         _connectionStatus.value = "Connected"
-        log("$model Connected! Pre-warming HUD link...")
+        log("$model Connected! Starting 360° connection ritual...")
 
         scope.launch {
-            delay(1_000L)
+            delay(500L)
             if (api.isConnected() && !stopRequested) {
-                runWatchOp("Pre-sync timezone") {
+                runWatchOp("360° Connection Ritual") {
                     ensureTimezoneSynced()
-                }
-                if (clockDirty) {
-                    syncRealTime()
+                    performConnectionRitual360()
                 }
                 sendKeepAlivePing()
                 loadWatchFeaturesFromWatch()
             }
         }
+    }
+
+    /**
+     * Spins the hands 180 degrees opposite the current time, waits for the stepper motors
+     * to hit full stride, and then sweeps the remaining 180 degrees back to exact real time.
+     */
+    private suspend fun performConnectionRitual360() {
+        val now = Calendar.getInstance()
+        val oppositeHour = (now.get(Calendar.HOUR_OF_DAY) + 6) % 24
+        val oppositeMinute = (now.get(Calendar.MINUTE) + 30) % 60
+
+        log("Ritual: Sweeping hands across dial...")
+        clockDirty = true
+        writeWatchTimeFast { epochMsForTodayAt(oppositeHour, oppositeMinute, 0) }
+        delay(2_600L) // Let physical stepper motors sweep across the face
+        log("Ritual: Locking onto exact real time...")
+        restoreClock()
     }
 
     private fun onWatchLost() {
@@ -411,6 +428,7 @@ class WatchController private constructor(appContext: Context) {
         }
     }
 
+    /** Cancels any background ping immediately so incoming calls never wait in a queue. */
     private fun launchPriorityWatchOp(label: String, block: suspend () -> Unit): Job {
         keepAliveJob?.cancel()
         activeOpJob?.cancel()
@@ -427,39 +445,113 @@ class WatchController private constructor(appContext: Context) {
         }
     }
 
+    /** Ultra-fast time write: assumes timezone was already synced on connect so only 1 BLE write occurs. */
     private suspend fun writeWatchTimeFast(epochMs: () -> Long) {
         var attempt = 0
         while (true) {
             try {
-                ensureTimezoneSynced()
                 TimeIO.set(epochMs())
                 return
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 if (++attempt >= WRITE_ATTEMPTS) throw e
-                timezoneSynced = false
                 CachedIO.clearCache()
+                ensureTimezoneSynced()
                 log("Time write retry (${e.message})...")
                 delay(WRITE_RETRY_DELAY_MS)
             }
         }
     }
 
-    private suspend fun setHandsToQuadrant(slot: Int, callerLabel: String) {
-        val (hour, minute, labelText) = when (slot) {
-            12 -> Triple(12, 0, "12:00 (12 o'clock)")
-            3 -> Triple(3, 15, "03:15 (3 o'clock)")
-            6 -> Triple(6, 30, "06:30 (6 o'clock)")
-            9 -> Triple(9, 45, "09:45 (9 o'clock)")
-            else -> Triple(12, 0, "12:00 (12 o'clock)")
+    /**
+     * FAST CALL ALERT:
+     * 1. First moves the hands immediately via a single `TimeIO.set` write so there is zero lag.
+     * 2. Then arms only that specific alarm slot at the `:00` rollover so the watch beeps,
+     *    backing up your existing user alarms in memory so they are never lost!
+     */
+    private suspend fun executeFastCallAlert(slot: Int, callerLabel: String) {
+        val (targetHour, targetMin, preHour, preMin, alarmIdx) = when (slot) {
+            12 -> CallQuadSpec(12, 0, 11, 59, 0)
+            3 -> CallQuadSpec(3, 15, 3, 14, 1)
+            6 -> CallQuadSpec(6, 30, 6, 29, 2)
+            9 -> CallQuadSpec(9, 45, 9, 44, 3)
+            else -> CallQuadSpec(12, 0, 11, 59, 0)
         }
+
         val startMs = System.currentTimeMillis()
-        log("HUD Alert [$callerLabel] -> Moving hands to $labelText...")
         clockDirty = true
-        writeWatchTimeFast { epochMsForTodayAt(hour, minute, 0) }
+
+        // Snapshot user's alarms once before modifying the target slot
+        if (userAlarmsSnapshot == null) {
+            userAlarmsSnapshot = _alarms.value.map { it.copy() }
+        }
+
+        // Step 1: Arm only the specific alarm slot in our cached alarm list (no slow getAlarms() read!)
+        val baseList = (userAlarmsSnapshot ?: _alarms.value).toMutableList()
+        while (baseList.size < 5) baseList.add(AlarmEntry())
+        val chime = baseList[0].hasHourlyChime
+        baseList[alarmIdx] = AlarmEntry(
+            hour = targetHour,
+            minute = targetMin,
+            enabled = true,
+            hasHourlyChime = if (alarmIdx == 0) chime else false
+        )
+
+        val apiAlarms = ArrayList<Alarm>(
+            baseList.mapIndexed { idx, e ->
+                Alarm(
+                    e.hour ?: 0,
+                    e.minute ?: 0,
+                    e.enabled && e.hour != null && e.minute != null,
+                    if (idx == 0) chime else false
+                )
+            }
+        )
+
+        // Write the targeted alarm and immediately set clock to :58 seconds before target minute
+        // so the hands sweep immediately AND the watch rolls over to :00 to trigger the beep!
+        runCatching { api.setAlarms(apiAlarms) }
+        writeWatchTimeFast { epochMsForTodayAt(preHour, preMin, 58) }
+
         val elapsed = System.currentTimeMillis() - startMs
-        log("HUD hands locked at $labelText (${elapsed}ms).")
+        log("HUD + Beep Alert [$callerLabel] -> Slot $slot (${elapsed}ms)")
+    }
+
+    private data class CallQuadSpec(
+        val targetHour: Int,
+        val targetMin: Int,
+        val preHour: Int,
+        val preMin: Int,
+        val alarmIdx: Int
+    )
+
+    private suspend fun restoreClockAndAlarms() {
+        log("Restoring real phone time...")
+        writeWatchTimeFast { currentEpochForSelectedTimezone() }
+        clockDirty = false
+
+        // Restore the user's exact pre-call alarms so the temporary call alarm is removed cleanly
+        val snapshot = userAlarmsSnapshot
+        if (snapshot != null) {
+            userAlarmsSnapshot = null
+            _alarms.value = snapshot
+            runCatching {
+                val chime = snapshot.firstOrNull()?.hasHourlyChime == true
+                val apiList = ArrayList<Alarm>(
+                    snapshot.mapIndexed { idx, e ->
+                        Alarm(
+                            e.hour ?: 0,
+                            e.minute ?: 0,
+                            e.enabled && e.hour != null && e.minute != null,
+                            if (idx == 0) chime else false
+                        )
+                    }
+                )
+                api.setAlarms(apiList)
+                log("Temporary call alarm cleared; user alarms restored.")
+            }
+        }
     }
 
     private suspend fun restoreClock() {
@@ -488,8 +580,14 @@ class WatchController private constructor(appContext: Context) {
     // ---------------------------------------- Public HUD & Time Sync Triggers
 
     fun pointHandsForCall(slot: Int, callerLabel: String = "VIP") {
-        launchPriorityWatchOp("HUD Alert ($slot o'clock)") {
-            setHandsToQuadrant(slot, callerLabel)
+        launchPriorityWatchOp("HUD Call Alert ($slot o'clock)") {
+            executeFastCallAlert(slot, callerLabel)
+        }
+    }
+
+    fun restoreAfterCall() {
+        launchPriorityWatchOp("Restore after call") {
+            restoreClockAndAlarms()
         }
     }
 
@@ -525,9 +623,8 @@ class WatchController private constructor(appContext: Context) {
                     val rawAlarms = api.getAlarms()
                     if (rawAlarms.isNotEmpty()) {
                         val currentList = _alarms.value
-                        _alarms.value = rawAlarms.take(5).mapIndexed { idx, a ->
+                        val mapped = rawAlarms.take(5).mapIndexed { idx, a ->
                             val existing = currentList.getOrNull(idx)
-                            // Keep unconfigured disabled alarms empty (--:--) unless enabled or previously set by user
                             val showTime = a.enabled || existing?.hour != null
                             AlarmEntry(
                                 hour = if (showTime) a.hour else null,
@@ -536,6 +633,8 @@ class WatchController private constructor(appContext: Context) {
                                 hasHourlyChime = a.hasHourlyChime
                             )
                         }
+                        _alarms.value = mapped
+                        userAlarmsSnapshot = null
                         log("Loaded ${rawAlarms.size} alarms from watch.")
                     }
                 }.onFailure { log("Could not read alarms: ${it.message}") }
@@ -564,6 +663,7 @@ class WatchController private constructor(appContext: Context) {
             current[0] = current[0].copy(hasHourlyChime = chime)
         }
         _alarms.value = current
+        userAlarmsSnapshot = null
         pushAlarmsToWatch(current)
     }
 
@@ -572,6 +672,7 @@ class WatchController private constructor(appContext: Context) {
         if (index !in current.indices) return
         current[index] = current[index].copy(hour = null, minute = null, enabled = false)
         _alarms.value = current
+        userAlarmsSnapshot = null
         pushAlarmsToWatch(current)
     }
 
@@ -580,6 +681,7 @@ class WatchController private constructor(appContext: Context) {
         if (current.isEmpty()) return
         current[0] = current[0].copy(hasHourlyChime = enabled)
         _alarms.value = current
+        userAlarmsSnapshot = null
         pushAlarmsToWatch(current)
     }
 

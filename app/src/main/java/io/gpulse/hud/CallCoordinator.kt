@@ -17,7 +17,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Looks a phone number up in the phone's contacts or recent call log. */
 object ContactLookup {
     fun nameFor(context: Context, number: String): String? {
         val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
@@ -61,10 +60,6 @@ object ContactLookup {
     }
 }
 
-/**
- * Matches incoming phone calls against the 4 VIP HUD slots (12, 3, 6, 9) with minimal latency,
- * moves the watch hands while ringing, and restores real time when answered or missed.
- */
 class CallCoordinator(
     private val context: Context,
     private val scope: CoroutineScope,
@@ -82,12 +77,14 @@ class CallCoordinator(
         if (number.isNullOrBlank()) {
             if (waitingForNumber?.isActive == true) return
             waitingForNumber = scope.launch {
-                // Short 250ms window for the second broadcast with the number to arrive
-                delay(250L)
+                // Ultra-short 80ms wait for second broadcast before hitting CallLog
+                delay(80L)
                 val fallbackNum = withContext(Dispatchers.IO) {
                     ContactLookup.latestIncomingNumber(context)
                 }
-                fire(fallbackNum)
+                if (!fallbackNum.isNullOrBlank()) {
+                    fire(fallbackNum)
+                }
             }
             return
         }
@@ -100,8 +97,8 @@ class CallCoordinator(
         alertedThisRing = false
         if (callAlertActive) {
             callAlertActive = false
-            watchController.log("Call $reason — restoring real time on watch.")
-            watchController.syncRealTime()
+            watchController.log("Call $reason — restoring time & clearing temporary call alarm.")
+            watchController.restoreAfterCall()
         }
     }
 
@@ -109,13 +106,18 @@ class CallCoordinator(
         if (alertedThisRing) return
         alertedThisRing = true
         scope.launch {
+            // 1. Check raw phone number digits FIRST before even querying Contacts DB for zero-ms matching
+            val fastDigitSlot = findMatchingSlot(null, number)
+            if (fastDigitSlot != null) {
+                callAlertActive = true
+                watchController.pointHandsForCall(fastDigitSlot, number ?: "VIP")
+                return@launch
+            }
+
+            // 2. Otherwise resolve contact name on IO thread and match
             val contact = number?.let { withContext(Dispatchers.IO) { ContactLookup.nameFor(context, it) } }
             val label = contact ?: number ?: "Unknown caller"
             watchController.log("Incoming call detected: $label")
-
-            if (number == null && !hasPermission(Manifest.permission.READ_CALL_LOG)) {
-                watchController.log("No caller number received — grant Call Log & Phone permissions.")
-            }
 
             val matchedSlot = findMatchingSlot(contact, number)
             if (matchedSlot != null) {
@@ -135,14 +137,12 @@ class CallCoordinator(
             val saved = Prefs.getVipContact(context, slot).trim()
             if (saved.isEmpty()) continue
 
-            // 1. Check case-insensitive contact name match
             if (!contactName.isNullOrBlank() &&
                 (contactName.contains(saved, ignoreCase = true) || saved.contains(contactName, ignoreCase = true))
             ) {
                 return slot
             }
 
-            // 2. Check phone number digit match (at least 4 digits)
             val savedDigits = saved.filter { it.isDigit() }
             if (savedDigits.length >= 4 && incomingDigits.length >= 4) {
                 if (incomingDigits.endsWith(savedDigits) ||
@@ -155,12 +155,8 @@ class CallCoordinator(
         }
         return null
     }
-
-    private fun hasPermission(p: String) =
-        ContextCompat.checkSelfPermission(context, p) == PackageManager.PERMISSION_GRANTED
 }
 
-/** Registered by KeepAliveService while it runs. */
 class CallStateReceiver(private val coordinator: CallCoordinator) : BroadcastReceiver() {
     @Suppress("DEPRECATION")
     override fun onReceive(context: Context, intent: Intent) {
