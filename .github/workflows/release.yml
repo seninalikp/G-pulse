@@ -32,8 +32,30 @@ jobs:
 
       - name: Prepare APK Assets
         run: |
+          cp app/build/outputs/apk/debug/app-debug.apk G-Pulse-v2fixed.apk
           cp app/build/outputs/apk/debug/app-debug.apk G-Pulse-v2.0.apk
           cp app/build/outputs/apk/debug/app-debug.apk G-Pulse-v1.0.apk
+
+      - name: Publish & Attach APK to v2fixed Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2fixed
+          name: "G-Pulse HUD v2fixed (Call Latency & 360° Ritual)"
+          files: G-Pulse-v2fixed.apk
+          draft: false
+          prerelease: false
+          body: |
+            ### 📦 Direct APK Download
+            Download and install the pre-compiled APK directly on your phone:
+            - **[G-Pulse-v2fixed.apk](https://github.com/${{ github.repository }}/releases/download/v2fixed/G-Pulse-v2fixed.apk)**
+
+            ### What's New in v2fixed:
+            - **Ultra-Fast Single-Packet `:58` Call Alert:** Reduced incoming call VIP hand movement latency to ~300ms.
+            - **360° Connection Ritual:** Watch sweeps hands across the dial on Bluetooth connection as a physical confirmation.
+            - **Instant Number Matching:** Raw phone number comparison bypasses Contacts query when matching digits.
+            - **Automatic Post-Call Alarm Restoration:** Temporary call-beep alarms are cleared and user alarms restored cleanly.
+
+            *(Ignore `Source code (zip)` unless you are compiling from source).*
 
       - name: Publish & Attach APK to v2.0 Release
         uses: softprops/action-gh-release@v2
